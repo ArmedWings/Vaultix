@@ -9,6 +9,7 @@ from email.mime.multipart import MIMEMultipart
 from typing import Optional
 import config
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -49,7 +50,9 @@ def init_db():
         cursor.execute('''CREATE TABLE IF NOT EXISTS users
                          (email TEXT PRIMARY KEY, 
                           password TEXT,
-                          verification_code TEXT)''')
+                          verification_code TEXT,
+                          code_created_at TIMESTAMP,
+                          last_code_request TIMESTAMP)''')
 
 def hash_password(password: str) -> str:
     # Удаляем эту функцию, так как пароль уже захэширован на клиенте
@@ -77,6 +80,20 @@ async def send_verification_email(email: str, code: str) -> bool:
     except Exception as e:
         print("Ошибка отправки email:", e)
         return False
+
+async def can_request_new_code(email: str) -> bool:
+    with Database() as cursor:
+        cursor.execute(
+            'SELECT last_code_request FROM users WHERE email = ?',
+            (email,)
+        )
+        result = cursor.fetchone()
+        if not result or not result['last_code_request']:
+            return True
+            
+        last_request = datetime.fromisoformat(result['last_code_request'])
+        time_passed = datetime.now() - last_request
+        return time_passed.total_seconds() >= 60  # 60 секунд задержка
 
 @app.post("/register")
 async def register(user: UserRegister):
@@ -117,17 +134,26 @@ async def login(user: UserLogin):
                 detail="Неверный логин или пароль"
             )
 
-        # Сравниваем уже захэшированные пароли
         if result['password'] == user.password:
+            if not await can_request_new_code(user.email):
+                raise HTTPException(
+                    status_code=429,
+                    detail="Подождите 60 секунд перед повторной отправкой кода"
+                )
+
             verification_code = generate_verification_code()
+            current_time = datetime.now().isoformat()
+            
             cursor.execute(
-                'UPDATE users SET verification_code = ? WHERE email = ?',
-                (verification_code, user.email)
+                '''UPDATE users 
+                   SET verification_code = ?, 
+                       code_created_at = ?,
+                       last_code_request = ?
+                   WHERE email = ?''',
+                (verification_code, current_time, current_time, user.email)
             )
             
-            # Отправляем код на email
             if await send_verification_email(user.email, verification_code):
-                print(f"Код подтверждения создан для пользователя {user.email}")
                 return {"message": "Код для входа отправлен на ваш email"}
             else:
                 raise HTTPException(
@@ -144,30 +170,41 @@ async def login(user: UserLogin):
 async def verify_code(verify: VerifyCode):
     with Database() as cursor:
         cursor.execute(
-            'SELECT verification_code FROM users WHERE email = ?',
+            '''SELECT verification_code, code_created_at 
+               FROM users WHERE email = ?''',
             (verify.email,)
         )
         result = cursor.fetchone()
         
-        if not result:
+        if not result or not result['verification_code']:
             raise HTTPException(
                 status_code=404,
-                detail="Пользователь не найден"
+                detail="Код подтверждения не найден"
             )
-        
-        if result['verification_code'] == verify.code:
-            # Очищаем код после успешной верификации
+
+        # Проверяем срок действия кода (5 минут)
+        code_created = datetime.fromisoformat(result['code_created_at'])
+        time_passed = datetime.now() - code_created
+        if time_passed.total_seconds() > 300:  # 300 секунд = 5 минут
             cursor.execute(
                 'UPDATE users SET verification_code = NULL WHERE email = ?',
                 (verify.email,)
             )
-            print(f"Код подтверждения верный для пользователя {verify.email}")
-            return {"message": "Verification successful"}
-        else:
-            print(f"Неверный код подтверждения для пользователя {verify.email}")
             raise HTTPException(
                 status_code=401,
-                detail="Invalid verification code"
+                detail="Срок действия кода истек"
+            )
+        
+        if result['verification_code'] == verify.code:
+            cursor.execute(
+                'UPDATE users SET verification_code = NULL WHERE email = ?',
+                (verify.email,)
+            )
+            return {"message": "Verification successful"}
+        else:
+            raise HTTPException(
+                status_code=401,
+                detail="Неверный код подтверждения"
             )
 
 if __name__ == '__main__':
