@@ -3,6 +3,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QLabel, QPushButton, QLineEdit, QMessageBox)
 from PyQt6.QtCore import Qt
 import requests
+import hashlib
+import client_config
 
 class LoginWindow(QMainWindow):
     def __init__(self):
@@ -43,12 +45,16 @@ class LoginWindow(QMainWindow):
         register_button.clicked.connect(self.register)
         layout.addWidget(register_button)
 
+    def hash_password(self, password: str) -> str:
+        salted = password + client_config.HASH_SALT
+        return hashlib.sha256(salted.encode()).hexdigest()
+
     def login(self):
         email = self.email_input.text()
-        password = self.password_input.text()
+        password = self.hash_password(self.password_input.text())
 
         try:
-            response = requests.post('http://localhost:5000/login',
+            response = requests.post(f'{client_config.SERVER_URL}/login',
                                    json={'email': email, 'password': password})
             
             if response.status_code == 200:
@@ -71,10 +77,10 @@ class LoginWindow(QMainWindow):
 
     def register(self):
         email = self.email_input.text()
-        password = self.password_input.text()
+        password = self.hash_password(self.password_input.text())
 
         try:
-            response = requests.post('http://localhost:5000/register',
+            response = requests.post(f'{client_config.SERVER_URL}/register',
                                    json={'email': email, 'password': password})
             
             if response.status_code == 200:
@@ -128,7 +134,7 @@ class VerificationWindow(QMainWindow):
     def verify_code(self):
         code = self.code_input.text()
         try:
-            response = requests.post('http://localhost:5000/verify',
+            response = requests.post(f'{client_config.SERVER_URL}/verify',
                                    json={'email': self.email, 'code': code})
             
             if response.status_code == 200:
@@ -143,7 +149,7 @@ class VerificationWindow(QMainWindow):
 
     def resend_code(self):
         try:
-            response = requests.post('http://localhost:5000/login',
+            response = requests.post(f'{client_config.SERVER_URL}/login',
                                    json={'email': self.email, 'password': ''})
             if response.status_code == 200:
                 QMessageBox.information(self, 'Успех', 'Новый код отправлен')

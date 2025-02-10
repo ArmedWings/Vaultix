@@ -52,7 +52,8 @@ def init_db():
                           verification_code TEXT)''')
 
 def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
+    # Удаляем эту функцию, так как пароль уже захэширован на клиенте
+    return password
 
 def generate_verification_code() -> str:
     return ''.join([str(random.randint(0, 9)) for _ in range(6)])
@@ -80,7 +81,6 @@ async def send_verification_email(email: str, code: str) -> bool:
 @app.post("/register")
 async def register(user: UserRegister):
     with Database() as cursor:
-        # Проверяем существование email
         cursor.execute('SELECT email FROM users WHERE email = ?', (user.email,))
         if cursor.fetchone():
             raise HTTPException(
@@ -89,9 +89,10 @@ async def register(user: UserRegister):
             )
             
         try:
+            # Сохраняем уже захэшированный пароль
             cursor.execute(
                 'INSERT INTO users (email, password) VALUES (?, ?)',
-                (user.email, hash_password(user.password))
+                (user.email, user.password)
             )
             print(f"Зарегистрирован новый пользователь: {user.email}")
             return {"message": "Регистрация прошла успешно"}
@@ -116,8 +117,8 @@ async def login(user: UserLogin):
                 detail="Неверный логин или пароль"
             )
 
-        if result['password'] == hash_password(user.password):
-            # Генерируем и сохраняем код подтверждения
+        # Сравниваем уже захэшированные пароли
+        if result['password'] == user.password:
             verification_code = generate_verification_code()
             cursor.execute(
                 'UPDATE users SET verification_code = ? WHERE email = ?',

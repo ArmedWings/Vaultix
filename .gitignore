@@ -1,9 +1,11 @@
+#Конфиги с личными данными
 server/config.py
-
+client_config.py
 # База данных
 *.db
+
 
 # Python
 __pycache__/
 *.py[cod]
-*$py.class 
+*$py.class
