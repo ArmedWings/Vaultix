@@ -1,7 +1,6 @@
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, EmailStr
 import sqlite3
-import hashlib
 import random
 import smtplib
 from email.mime.text import MIMEText
@@ -10,12 +9,17 @@ from typing import Optional
 import config
 from contextlib import asynccontextmanager
 from datetime import datetime
-from slowapi import Limiter
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
-from fastapi.responses import JSONResponse
+import redis
+from time import time
 
-limiter = Limiter(key_func=get_remote_address)
+# Инициализация Redis
+redis_client = redis.Redis(host='localhost', port=6379, db=0)
+
+# Константы для ограничения
+GLOBAL_REQUEST_LIMIT = 10
+LOGIN_REQUEST_LIMIT = 3
+REGISTER_REQUEST_LIMIT = 1
+TIME_WINDOW = 60  # 60 секунд
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -23,20 +27,6 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(lifespan=lifespan)
-
-@limiter.limit("1/minute")
-async def check_global_limit(request: Request):
-    return True
-
-# Оставляем только базовые лимиты на эндпоинтах
-@app.middleware("http")
-async def global_limiter(request: Request, call_next):
-    try:
-        await check_global_limit(request)
-        response = await call_next(request)
-        return response
-    except RateLimitExceeded as exc:
-        return await custom_rate_limit_handler(request, exc)
 
 # Модели данных Pydantic для валидации
 class UserRegister(BaseModel):
@@ -75,7 +65,6 @@ def init_db():
                           last_code_request TIMESTAMP)''')
 
 def hash_password(password: str) -> str:
-    # Удаляем эту функцию, так как пароль уже захэширован на клиенте
     return password
 
 def generate_verification_code() -> str:
@@ -115,8 +104,30 @@ async def can_request_new_code(email: str) -> bool:
         time_passed = datetime.now() - last_request
         return time_passed.total_seconds() >= 60  # 60 секунд задержка
 
+def check_rate_limit(ip_address: str, endpoint: str, limit: int) -> bool:
+    key = f"{endpoint}:{ip_address}"
+    request_count = redis_client.get(key)
+
+    if request_count is None:
+        redis_client.set(key, 1, ex=TIME_WINDOW)
+    else:
+        request_count = int(request_count)
+        if request_count >= limit:
+            return False
+        redis_client.incr(key)
+    
+    return True
+
 @app.post("/register")
-async def register(user: UserRegister):
+async def register(user: UserRegister, request: Request):
+    ip_address = request.client.host  # Получаем IP-адрес клиента
+
+    if not check_rate_limit(ip_address, "register", REGISTER_REQUEST_LIMIT):
+        raise HTTPException(
+            status_code=429,
+            detail="Слишком много регистраций. Пожалуйста, подождите перед следующей попыткой."
+        )
+
     with Database() as cursor:
         cursor.execute('SELECT email FROM users WHERE email = ?', (user.email,))
         if cursor.fetchone():
@@ -126,7 +137,6 @@ async def register(user: UserRegister):
             )
             
         try:
-            # Сохраняем уже захэшированный пароль
             cursor.execute(
                 'INSERT INTO users (email, password) VALUES (?, ?)',
                 (user.email, user.password)
@@ -140,7 +150,15 @@ async def register(user: UserRegister):
             )
 
 @app.post("/login")
-async def login(user: UserLogin):
+async def login(user: UserLogin, request: Request):
+    ip_address = request.client.host  # Получаем IP-адрес клиента
+
+    if not check_rate_limit(ip_address, "login", LOGIN_REQUEST_LIMIT):
+        raise HTTPException(
+            status_code=429,
+            detail="Слишком много запросов на вход. Пожалуйста, подождите перед следующей попыткой."
+        )
+
     with Database() as cursor:
         cursor.execute(
             'SELECT password FROM users WHERE email = ?',
@@ -197,10 +215,7 @@ async def verify_code(verify: VerifyCode):
         result = cursor.fetchone()
         
         if not result or not result['verification_code']:
-            raise HTTPException(
-                status_code=404,
-                detail="Код подтверждения не найден"
-            )
+            return {"message": "Код подтверждения не найден"}
 
         # Проверяем срок действия кода (5 минут)
         code_created = datetime.fromisoformat(result['code_created_at'])
@@ -210,10 +225,7 @@ async def verify_code(verify: VerifyCode):
                 'UPDATE users SET verification_code = NULL WHERE email = ?',
                 (verify.email,)
             )
-            raise HTTPException(
-                status_code=401,
-                detail="Срок действия кода истек"
-            )
+            return {"message": "Срок действия кода истек"}
         
         if result['verification_code'] == verify.code:
             cursor.execute(
@@ -222,20 +234,7 @@ async def verify_code(verify: VerifyCode):
             )
             return {"message": "Verification successful"}
         else:
-            raise HTTPException(
-                status_code=401,
-                detail="Неверный код подтверждения"
-            )
-
-# Определяем обработчик для лимитов
-async def custom_rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
-    return JSONResponse(
-        status_code=429,
-        content={
-            "detail": "Слишком много запросов. Пожалуйста, подождите перед следующей попыткой.",
-            "retry_after": exc.retry_after if hasattr(exc, 'retry_after') else 60
-        }
-    )
+            return {"message": "Неверный код подтверждения"}
 
 if __name__ == '__main__':
     import uvicorn
