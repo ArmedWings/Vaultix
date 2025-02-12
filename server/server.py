@@ -19,6 +19,7 @@ redis_client = redis.Redis(host='localhost', port=6379, db=0)
 GLOBAL_REQUEST_LIMIT = 10
 LOGIN_REQUEST_LIMIT = 3
 REGISTER_REQUEST_LIMIT = 1
+VERIFY_REQUEST_LIMIT = 3  # Добавлено ограничение на попытки ввода кода
 TIME_WINDOW = 60  # 60 секунд
 
 @asynccontextmanager
@@ -142,7 +143,7 @@ async def register(user: UserRegister, request: Request):
                 (user.email, user.password)
             )
             print(f"Зарегистрирован новый пользователь: {user.email}")
-            return {"message": "Регистрация прошла успешно"}
+            return {"message": "Регистрация прошла успешно"}  # Успешный ответ
         except sqlite3.IntegrityError:
             raise HTTPException(
                 status_code=400,
@@ -192,7 +193,7 @@ async def login(user: UserLogin, request: Request):
             )
             
             if await send_verification_email(user.email, verification_code):
-                return {"message": "Код для входа отправлен на ваш email"}
+                return {"message": "Код для входа отправлен на ваш email"}  # Успешный ответ
             else:
                 raise HTTPException(
                     status_code=500,
@@ -205,7 +206,15 @@ async def login(user: UserLogin, request: Request):
             )
 
 @app.post("/verify")
-async def verify_code(verify: VerifyCode):
+async def verify_code(verify: VerifyCode, request: Request):
+    ip_address = request.client.host  # Получаем IP-адрес клиента
+
+    if not check_rate_limit(ip_address, "verify", VERIFY_REQUEST_LIMIT):
+        raise HTTPException(
+            status_code=429,
+            detail="Слишком много попыток ввода кода. Пожалуйста, подождите перед следующей попыткой."
+        )
+
     with Database() as cursor:
         cursor.execute(
             '''SELECT verification_code, code_created_at 
@@ -215,7 +224,10 @@ async def verify_code(verify: VerifyCode):
         result = cursor.fetchone()
         
         if not result or not result['verification_code']:
-            return {"message": "Код подтверждения не найден"}
+            raise HTTPException(
+                status_code=404,
+                detail="Код подтверждения не найден"
+            )
 
         # Проверяем срок действия кода (5 минут)
         code_created = datetime.fromisoformat(result['code_created_at'])
@@ -225,16 +237,22 @@ async def verify_code(verify: VerifyCode):
                 'UPDATE users SET verification_code = NULL WHERE email = ?',
                 (verify.email,)
             )
-            return {"message": "Срок действия кода истек"}
+            raise HTTPException(
+                status_code=400,
+                detail="Срок действия кода истек"
+            )
         
         if result['verification_code'] == verify.code:
             cursor.execute(
                 'UPDATE users SET verification_code = NULL WHERE email = ?',
                 (verify.email,)
             )
-            return {"message": "Verification successful"}
+            return {"message": "Verification successful"}  # Успешный ответ
         else:
-            return {"message": "Неверный код подтверждения"}
+            raise HTTPException(
+                status_code=401,
+                detail="Неверный код подтверждения"
+            )
 
 if __name__ == '__main__':
     import uvicorn
