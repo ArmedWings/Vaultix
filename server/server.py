@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, EmailStr
 import sqlite3
 import hashlib
@@ -10,6 +10,12 @@ from typing import Optional
 import config
 from contextlib import asynccontextmanager
 from datetime import datetime
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from fastapi.responses import JSONResponse
+
+limiter = Limiter(key_func=get_remote_address)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -17,6 +23,20 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(lifespan=lifespan)
+
+@limiter.limit("1/minute")
+async def check_global_limit(request: Request):
+    return True
+
+# Оставляем только базовые лимиты на эндпоинтах
+@app.middleware("http")
+async def global_limiter(request: Request, call_next):
+    try:
+        await check_global_limit(request)
+        response = await call_next(request)
+        return response
+    except RateLimitExceeded as exc:
+        return await custom_rate_limit_handler(request, exc)
 
 # Модели данных Pydantic для валидации
 class UserRegister(BaseModel):
@@ -206,6 +226,16 @@ async def verify_code(verify: VerifyCode):
                 status_code=401,
                 detail="Неверный код подтверждения"
             )
+
+# Определяем обработчик для лимитов
+async def custom_rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+    return JSONResponse(
+        status_code=429,
+        content={
+            "detail": "Слишком много запросов. Пожалуйста, подождите перед следующей попыткой.",
+            "retry_after": exc.retry_after if hasattr(exc, 'retry_after') else 60
+        }
+    )
 
 if __name__ == '__main__':
     import uvicorn
