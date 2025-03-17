@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Depends
 from pydantic import BaseModel, EmailStr
 import sqlite3
 import random
@@ -8,12 +8,24 @@ from email.mime.multipart import MIMEMultipart
 from typing import Optional
 import config
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import redis
 from time import time
+import jwt
+from fastapi.security import OAuth2PasswordBearer
+from uuid import uuid4
 
 # Инициализация Redis
 redis_client = redis.Redis(host='localhost', port=6379, db=0)
+
+# JWT конфигурация
+JWT_SECRET = "your-secret-key"  # В продакшене использовать безопасный ключ
+JWT_ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+REFRESH_TOKEN_EXPIRE_DAYS = 30
+
+# OAuth2 схема для получения токена из заголовка
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 # Константы для ограничения
 GLOBAL_REQUEST_LIMIT = 10
@@ -63,7 +75,9 @@ def init_db():
                           password TEXT,
                           verification_code TEXT,
                           code_created_at TIMESTAMP,
-                          last_code_request TIMESTAMP)''')
+                          last_code_request TIMESTAMP,
+                          refresh_token TEXT,
+                          refresh_token_expires_at TIMESTAMP)''')
 
 def hash_password(password: str) -> str:
     return password
@@ -205,9 +219,76 @@ async def login(user: UserLogin, request: Request):
                 detail="Неверный логин или пароль"
             )
 
+def create_access_token(data: dict) -> str:
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire.timestamp()})  # Используем timestamp для JWT
+    return jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+def create_refresh_token() -> tuple[str, datetime]:
+    refresh_token = str(uuid4())
+    expires_at = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    return refresh_token, expires_at
+
+async def get_current_user(token: str = Depends(oauth2_scheme)) -> str:
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            raise HTTPException(status_code=401, detail="Недействительный токен")
+        return email
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Токен истек")
+    except jwt.JWTError:
+        raise HTTPException(status_code=401, detail="Недействительный токен")
+
+@app.post("/refresh-token")
+async def refresh_token(current_refresh_token: str):
+    with Database() as cursor:
+        cursor.execute(
+            '''SELECT email, refresh_token, refresh_token_expires_at 
+               FROM users WHERE refresh_token = ?''',
+            (current_refresh_token,)
+        )
+        result = cursor.fetchone()
+        
+        if not result:
+            raise HTTPException(status_code=401, detail="Недействительный refresh token")
+        
+        expires_at = datetime.fromisoformat(result['refresh_token_expires_at'])
+        if datetime.now(timezone.utc) > expires_at:
+            raise HTTPException(status_code=401, detail="Refresh token истек")
+        
+        # Создаем новые токены
+        access_token = create_access_token({"sub": result['email']})
+        refresh_token, refresh_expires = create_refresh_token()
+        
+        # Обновляем refresh token в базе
+        cursor.execute(
+            '''UPDATE users 
+               SET refresh_token = ?, refresh_token_expires_at = ? 
+               WHERE email = ?''',
+            (refresh_token, refresh_expires.isoformat(), result['email'])
+        )
+        
+        return Token(
+            access_token=access_token,
+            refresh_token=refresh_token
+        )
+
+@app.post("/logout")
+async def logout(current_user: str = Depends(get_current_user)):
+    with Database() as cursor:
+        cursor.execute(
+            'UPDATE users SET refresh_token = NULL WHERE email = ?',
+            (current_user,)
+        )
+    return {"message": "Успешный выход из системы"}
+
+# Обновляем verify endpoint для возврата токенов
 @app.post("/verify")
 async def verify_code(verify: VerifyCode, request: Request):
-    ip_address = request.client.host  # Получаем IP-адрес клиента
+    ip_address = request.client.host
 
     if not check_rate_limit(ip_address, "verify", VERIFY_REQUEST_LIMIT):
         raise HTTPException(
@@ -229,10 +310,9 @@ async def verify_code(verify: VerifyCode, request: Request):
                 detail="Код подтверждения не найден"
             )
 
-        # Проверяем срок действия кода (5 минут)
         code_created = datetime.fromisoformat(result['code_created_at'])
         time_passed = datetime.now() - code_created
-        if time_passed.total_seconds() > 300:  # 300 секунд = 5 минут
+        if time_passed.total_seconds() > 300:
             cursor.execute(
                 'UPDATE users SET verification_code = NULL WHERE email = ?',
                 (verify.email,)
@@ -243,16 +323,42 @@ async def verify_code(verify: VerifyCode, request: Request):
             )
         
         if result['verification_code'] == verify.code:
+            # Создаем токены
+            access_token = create_access_token({"sub": verify.email})
+            refresh_token, refresh_expires = create_refresh_token()
+            
+            # Сохраняем refresh token
             cursor.execute(
-                'UPDATE users SET verification_code = NULL WHERE email = ?',
-                (verify.email,)
+                '''UPDATE users 
+                   SET verification_code = NULL,
+                       refresh_token = ?,
+                       refresh_token_expires_at = ?
+                   WHERE email = ?''',
+                (refresh_token, refresh_expires.isoformat(), verify.email)
             )
-            return {"message": "Verification successful"}  # Успешный ответ
+            
+            return Token(
+                access_token=access_token,
+                refresh_token=refresh_token
+            )
         else:
             raise HTTPException(
                 status_code=401,
                 detail="Неверный код подтверждения"
             )
+
+# Новые модели данных
+class Token(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+
+class TokenData(BaseModel):
+    email: str
+
+@app.get("/test-auth")
+async def test_auth(current_user: str = Depends(get_current_user)):
+    return {"message": "Тест успешен! Сессия активна.", "user": current_user}
 
 if __name__ == '__main__':
     import uvicorn

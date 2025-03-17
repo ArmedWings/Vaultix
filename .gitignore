@@ -3,6 +3,7 @@ server/config.py
 client_config.py
 # База данных
 *.db
+user_tokens.json
 
 
 # Python

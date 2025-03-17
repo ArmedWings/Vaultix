@@ -5,11 +5,49 @@ from PyQt6.QtCore import Qt, QTimer
 import requests
 import hashlib
 import client_config
+from token_storage import TokenStorage
 
 class LoginWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.token_storage = TokenStorage()
         self.initUI()
+
+    def check_saved_session(self) -> bool:
+        # Проверяем все сохраненные сессии
+        all_tokens = self.token_storage.get_all_tokens()
+        for email, tokens in all_tokens.items():
+            try:
+                # Пробуем сделать тестовый запрос с токеном
+                headers = {'Authorization': f'Bearer {tokens["access_token"]}'}
+                response = requests.get(
+                    f'{client_config.SERVER_URL}/test-auth',
+                    headers=headers
+                )
+                
+                if response.status_code == 200:
+                    print(f"Сессия активна для {email}")
+                    self.open_main_window(email)
+                    return True
+                    
+                # Если токен истек, пробуем обновить через refresh token
+                response = requests.post(
+                    f'{client_config.SERVER_URL}/refresh-token',
+                    json={'current_refresh_token': tokens['refresh_token']}
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    self.token_storage.store_tokens(
+                        email,
+                        data['access_token'],
+                        data['refresh_token']
+                    )
+                    self.open_main_window(email)
+                    return True
+            except Exception as e:
+                print(f"Ошибка проверки сессии: {e}")
+                self.token_storage.clear_tokens(email)
+        return False
 
     def initUI(self):
         self.setWindowTitle('Вход в систему')
@@ -101,6 +139,7 @@ class VerificationWindow(QMainWindow):
     def __init__(self, email):
         super().__init__()
         self.email = email
+        self.token_storage = TokenStorage()
         self.remaining_time = 300  # 5 минут в секундах
         self.resend_cooldown = 60  # 60 секунд задержка
         self.initUI()
@@ -181,8 +220,14 @@ class VerificationWindow(QMainWindow):
                                    json={'email': self.email, 'code': code})
             
             if response.status_code == 200:
+                data = response.json()
+                self.token_storage.store_tokens(
+                    self.email,
+                    data['access_token'],
+                    data['refresh_token']
+                )
                 print(f"Код подтвержден для пользователя {self.email}")
-                self.open_main_window()
+                self.open_main_window(self.email)
             else:
                 error_data = response.json()
                 error_message = error_data.get("detail", "Неверный код подтверждения")
@@ -206,8 +251,8 @@ class VerificationWindow(QMainWindow):
         except:
             QMessageBox.warning(self, 'Ошибка', 'Ошибка подключения к серверу')
 
-    def open_main_window(self):
-        self.main_window = MainWindow(self.email)
+    def open_main_window(self, email):
+        self.main_window = MainWindow(email)
         self.main_window.show()
         self.hide()
 
@@ -215,13 +260,13 @@ class MainWindow(QMainWindow):
     def __init__(self, email):
         super().__init__()
         self.email = email
+        self.token_storage = TokenStorage()
         self.initUI()
 
     def initUI(self):
         self.setWindowTitle('Система управления складом')
         self.setGeometry(100, 100, 800, 600)
 
-        # Центральный виджет
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
@@ -232,8 +277,76 @@ class MainWindow(QMainWindow):
         welcome_label.setStyleSheet("font-size: 24px; margin: 20px;")
         layout.addWidget(welcome_label)
 
+        # Кнопка для проверки сессии
+        test_button = QPushButton("Проверить сессию")
+        test_button.clicked.connect(self.test_session)
+        layout.addWidget(test_button)
+
+        # Кнопка выхода
+        logout_button = QPushButton("Выйти")
+        logout_button.clicked.connect(self.logout)
+        layout.addWidget(logout_button)
+
+    def test_session(self):
+        try:
+            tokens = self.token_storage.get_tokens(self.email)
+            if not tokens:
+                QMessageBox.warning(self, 'Ошибка', 'Токены не найдены')
+                return
+
+            headers = {'Authorization': f'Bearer {tokens["access_token"]}'}
+            response = requests.get(
+                f'{client_config.SERVER_URL}/test-auth',
+                headers=headers
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                QMessageBox.information(self, 'Успех', data['message'])
+            else:
+                # Пробуем обновить токен
+                response = requests.post(
+                    f'{client_config.SERVER_URL}/refresh-token',
+                    json={'current_refresh_token': tokens['refresh_token']}
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    self.token_storage.store_tokens(
+                        self.email,
+                        data['access_token'],
+                        data['refresh_token']
+                    )
+                    QMessageBox.information(self, 'Успех', 'Токен обновлен, сессия активна')
+                else:
+                    QMessageBox.warning(self, 'Ошибка', 'Сессия истекла')
+                    self.logout()
+        except Exception as e:
+            QMessageBox.warning(self, 'Ошибка', f'Ошибка проверки сессии: {str(e)}')
+
+    def logout(self):
+        try:
+            tokens = self.token_storage.get_tokens(self.email)
+            if tokens:
+                headers = {'Authorization': f'Bearer {tokens["access_token"]}'}
+                requests.post(
+                    f'{client_config.SERVER_URL}/logout',
+                    headers=headers
+                )
+                self.token_storage.clear_tokens(self.email)
+            
+            # Открываем окно входа
+            self.login_window = LoginWindow()
+            self.login_window.show()
+            self.close()
+        except:
+            QMessageBox.warning(self, 'Ошибка', 'Ошибка при выходе из системы')
+
 if __name__ == '__main__':
     app = QApplication(sys.argv)
-    window = LoginWindow()
-    window.show()
+    login_window = LoginWindow()
+    
+    # Проверяем сессию перед показом окна
+    if not login_window.check_saved_session():
+        login_window.show()
+    
     sys.exit(app.exec()) 
